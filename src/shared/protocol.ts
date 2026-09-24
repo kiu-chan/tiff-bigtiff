@@ -41,6 +41,9 @@ export interface LevelInfo {
   ifd: number;
   width: number;
   height: number;
+  /** Size of a tile, or width × rows per strip. */
+  tileWidth: number;
+  tileHeight: number;
 }
 
 export interface PageInfo {
@@ -79,22 +82,29 @@ export interface FileInfo {
   pages: PageInfo[];
 }
 
-export type RenderKind = 'preview' | 'detail';
+/** One display tile: `window` (full-resolution pixels) rendered at outWidth × outHeight. */
+export interface TileSpec {
+  id: string;
+  window: PixelWindow;
+  outWidth: number;
+  outHeight: number;
+}
 
 export type MainToWorker =
   | { type: 'open'; fileSize: number }
   | { type: 'readResult'; id: number; data: ArrayBuffer[] }
   | { type: 'readError'; id: number; message: string }
   | {
-      type: 'render';
-      reqId: number;
-      kind: RenderKind;
+      /**
+       * The display tiles wanted now, most urgent first. Replaces the previous
+       * list: tiles no longer listed are abandoned. `generation` changes when
+       * the page or tone changes, which invalidates everything rendered before.
+       */
+      type: 'tiles';
+      generation: number;
       page: number;
-      /** Window in full-resolution pixel coordinates. */
-      window: PixelWindow;
-      outWidth: number;
-      outHeight: number;
       tone: ToneMode;
+      tiles: TileSpec[];
     }
   | { type: 'pixel'; reqId: number; page: number; x: number; y: number };
 
@@ -102,16 +112,16 @@ export type WorkerToMain =
   | { type: 'read'; id: number; ranges: ByteRange[] }
   | { type: 'opened'; info: FileInfo }
   | { type: 'openError'; message: string }
-  | { type: 'progress'; reqId: number; kind: RenderKind; done: number; total: number }
+  | { type: 'progress'; generation: number; id: string; done: number; total: number }
   | {
-      type: 'rendered';
-      reqId: number;
-      kind: RenderKind;
-      page: number;
-      window: PixelWindow;
+      type: 'tile';
+      generation: number;
+      id: string;
       width: number;
       height: number;
       rgba: ArrayBuffer;
+      /** False for a partial result (rows not decoded yet are transparent). */
+      final: boolean;
     }
-  | { type: 'renderError'; reqId: number; kind: RenderKind; page: number; message: string }
+  | { type: 'tileError'; generation: number; id: string; message: string }
   | { type: 'pixel'; reqId: number; x: number; y: number; values: number[] | null };

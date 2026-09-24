@@ -1,6 +1,9 @@
-import { addDecoder, BaseDecoder, GeoTIFF, type GeoTIFFImage } from 'geotiff';
+import { addDecoder, BaseDecoder, GeoTIFF, getDecoder, type GeoTIFFImage } from 'geotiff';
+// Not exported from the package entry point.
+import { getDecoderParameters } from '../../node_modules/geotiff/dist-module/compression/index.js';
 import type { FileInfo, LevelInfo, PageInfo, PixelWindow, ToneMode } from '../shared/protocol';
 import { decodeCcitt } from './ccitt';
+import { JpegDecoder, usesNativeJpeg } from './jpeg';
 import type { MessageSource } from './messageSource';
 
 type Sample = ArrayLike<number> & { [index: number]: number };
@@ -24,6 +27,7 @@ const enum Tag {
   PlanarConfiguration = 284,
   PageName = 285,
   T4Options = 292,
+  JPEGTables = 347,
   ResolutionUnit = 296,
   Software = 305,
   DateTime = 306,
@@ -87,9 +91,15 @@ const SAMPLE_FORMAT_NAMES: Record<number, string> = {
   4: 'Undefined',
 };
 
+/** Longer text tags (e.g. embedded XML metadata) are cut in the info panel. */
+const MAX_TAG_TEXT = 1500;
+
 let decodersRegistered = false;
 
-/** Adds CCITT fax support (compression 2, 3, 4), which geotiff.js does not ship. */
+/**
+ * Adds CCITT fax support (compression 2, 3, 4), which geotiff.js does not ship,
+ * and replaces its JPEG decoder with one that uses the browser's native decoder.
+ */
 export function registerDecoders(): void {
   if (decodersRegistered) {
     return;
@@ -141,6 +151,29 @@ export function registerDecoders(): void {
       false,
     );
   }
+
+  addDecoder(
+    7,
+    async () => JpegDecoder as never,
+    async (fd) => {
+      const value = async (id: number) => (fd.hasTag(id) ? fd.loadValue(id) : undefined);
+      const tiled = fd.hasTag(Tag.TileWidth);
+      const imageLength = Number(await value(Tag.ImageLength));
+      return {
+        tileWidth: Number(await value(tiled ? Tag.TileWidth : Tag.ImageWidth)),
+        tileHeight: tiled
+          ? Number(await value(Tag.TileLength))
+          : Math.min(Number((await value(Tag.RowsPerStrip)) ?? imageLength), imageLength),
+        planarConfiguration: Number((await value(Tag.PlanarConfiguration)) ?? 1),
+        bitsPerSample: toArray(await value(Tag.BitsPerSample)),
+        predictor: 1,
+        samplesPerPixel: Number((await value(Tag.SamplesPerPixel)) ?? 1),
+        photometric: Number((await value(Tag.Photometric)) ?? 2),
+        JPEGTables: await value(Tag.JPEGTables),
+      } as never;
+    },
+    false,
+  );
 }
 
 type ColorKind = 'gray' | 'rgb' | 'palette' | 'cmyk' | 'ycbcr' | 'lab';
@@ -238,7 +271,13 @@ export async function openTiff(source: MessageSource): Promise<OpenedTiff> {
   for (const page of pages) {
     page.images.sort((a, b) => b.getWidth() - a.getWidth());
     page.info.levels = page.images.map(
-      (image): LevelInfo => ({ ifd: -1, width: image.getWidth(), height: image.getHeight() }),
+      (image): LevelInfo => ({
+        ifd: -1,
+        width: image.getWidth(),
+        height: image.getHeight(),
+        tileWidth: image.getTileWidth(),
+        tileHeight: image.getTileHeight(),
+      }),
     );
     page.info.levels[0].ifd = page.info.ifd;
   }
@@ -289,7 +328,8 @@ async function describePage(image: GeoTIFFImage, ifd: number): Promise<Page> {
       kind = spp >= 4 ? 'cmyk' : 'gray';
       break;
     case 6:
-      kind = spp >= 3 ? 'ycbcr' : 'gray';
+      // The native JPEG decoder already converts YCbCr to RGB.
+      kind = spp >= 3 ? (compression === 7 && usesNativeJpeg(6, spp) ? 'rgb' : 'ycbcr') : 'gray';
       break;
     case 8:
       kind = spp >= 3 ? 'lab' : 'gray';
@@ -342,7 +382,8 @@ async function describePage(image: GeoTIFFImage, ifd: number): Promise<Page> {
   const addText = async (label: string, id: number) => {
     const value = await tagValue(image, id);
     if (typeof value === 'string' && value.trim()) {
-      tags.push([label, value.replace(/\0+$/, '').trim()]);
+      const text = value.replace(/\0+$/, '').trim();
+      tags.push([label, text.length > MAX_TAG_TEXT ? `${text.slice(0, MAX_TAG_TEXT)}… (${text.length} characters)` : text]);
     }
   };
   await addText('Document name', Tag.DocumentName);
@@ -442,15 +483,30 @@ export class CancelledError extends Error {
   }
 }
 
-/** Budget for one decoded chunk, in pixels. */
-const CHUNK_PIXELS = 4 * 1024 * 1024;
+/** Upper bound for the decoded tiles held at once by one region read, in bytes. */
+const BATCH_BYTES = 64 * 1024 * 1024;
+/** Tiles decoded concurrently by one region read. */
+const MAX_BATCH_TILES = 16;
 /** Above this many source pixels we sample (nearest) instead of averaging. */
 const AVERAGE_LIMIT = 96 * 1024 * 1024;
+/** Recently decoded tiles are kept, since neighbouring display tiles often share them. */
+const TILE_CACHE_BYTES = 192 * 1024 * 1024;
 
 export interface RegionResult {
   data: Sample[];
   width: number;
   height: number;
+}
+
+export interface RegionOptions {
+  isCancelled?: () => boolean;
+  /** Awaited before each batch of tiles; lets a paused read wait. */
+  waitTurn?: () => Promise<void> | undefined;
+  /** Urgency of this read's tile decodes (lower first) when many reads compete. */
+  priority?: () => number;
+  onProgress?: (done: number, total: number) => void;
+  /** Called whenever more output rows are final; `snapshot()` returns rows [0, rows). */
+  onRows?: (rows: number, snapshot: () => Sample[]) => void;
 }
 
 /**
@@ -513,11 +569,206 @@ function lowerBound(values: Int32Array, target: number): number {
   return lo;
 }
 
+/** Random access to one sample of a decoded tile: value = array[pixel * stride + offset]. */
+interface Plane {
+  array: ArrayLike<number>;
+  stride: number;
+  offset: number;
+}
+
+const TYPED_ARRAYS: Record<number, Record<number, new (buffer: ArrayBufferLike, offset: number, length: number) => Sample>> = {
+  1: { 1: Uint8Array, 2: Uint16Array, 4: Uint32Array },
+  2: { 1: Int8Array, 2: Int16Array, 4: Int32Array },
+  3: { 4: Float32Array, 8: Float64Array },
+};
+
+function samplePlane(image: GeoTIFFImage, buffer: ArrayBufferLike, sample: number, pixels: number): Plane {
+  const bytes = image.getSampleByteSize(sample);
+  const planar = image.planarConfiguration;
+  const bytesPerPixel = planar === 1 ? image.getBytesPerPixel() : bytes;
+  let byteOffset = 0;
+  if (planar === 1) {
+    for (let i = 0; i < sample; i++) byteOffset += image.getSampleByteSize(i);
+  }
+  const format = image.getSampleFormat(sample);
+  const bits = image.getBitsPerSample(sample);
+  const Ctor = TYPED_ARRAYS[format]?.[bytes];
+  if (
+    Ctor &&
+    !(format === 3 && bits === 16) &&
+    (bytes === 1 || image.littleEndian) &&
+    bytesPerPixel % bytes === 0 &&
+    byteOffset % bytes === 0
+  ) {
+    return {
+      array: new Ctor(buffer, 0, Math.floor(buffer.byteLength / bytes)),
+      stride: bytesPerPixel / bytes,
+      offset: byteOffset / bytes,
+    };
+  }
+  // Big-endian multi-byte or float16 data: convert through a DataView.
+  const view = new DataView(buffer as ArrayBuffer);
+  const reader = image.getReaderForSample(sample);
+  const count = Math.min(pixels, Math.floor((buffer.byteLength - byteOffset) / bytesPerPixel) + 1);
+  const array = new Float64Array(count);
+  for (let i = 0; i < count; i++) {
+    array[i] = reader.call(view, i * bytesPerPixel + byteOffset, image.littleEndian);
+  }
+  return { array, stride: 1, offset: 0 };
+}
+
+// ---------------------------------------------------------------------------
+// Tile access
+// ---------------------------------------------------------------------------
+
+/** Tile reads and decodes in flight at once, across all region reads. */
+const MAX_TILE_READS = 96;
+let tileReads = 0;
+const tileReadWaiters: { priority: () => number; start: () => void }[] = [];
+
+/** Waits for a free tile read slot; the most urgent waiter gets the next one. */
+function acquireTileRead(priority: () => number): Promise<void> {
+  if (tileReads < MAX_TILE_READS) {
+    tileReads++;
+    return Promise.resolve();
+  }
+  return new Promise((start) => tileReadWaiters.push({ priority, start }));
+}
+
+function releaseTileRead(): void {
+  if (tileReadWaiters.length === 0) {
+    tileReads--;
+    return;
+  }
+  let best = 0;
+  let bestPriority = tileReadWaiters[0].priority();
+  for (let i = 1; i < tileReadWaiters.length; i++) {
+    const priority = tileReadWaiters[i].priority();
+    if (priority < bestPriority) {
+      best = i;
+      bestPriority = priority;
+    }
+  }
+  tileReadWaiters.splice(best, 1)[0].start();
+}
+
+const imageIds = new WeakMap<GeoTIFFImage, number>();
+let nextImageId = 1;
+const decoders = new WeakMap<GeoTIFFImage, Promise<BaseDecoder>>();
+const tileCache = new Map<string, ArrayBufferLike>();
+const tilesDecoding = new Map<string, Promise<ArrayBufferLike>>();
+let tileCacheBytes = 0;
+
+function decoderFor(image: GeoTIFFImage): Promise<BaseDecoder> {
+  let decoder = decoders.get(image);
+  if (!decoder) {
+    decoder = (async () => {
+      const compression = Number((await tagValue(image, Tag.Compression)) ?? 1);
+      return (await getDecoder(compression, await getDecoderParameters(compression, image.getFileDirectory()))) as BaseDecoder;
+    })();
+    decoders.set(image, decoder);
+  }
+  return decoder;
+}
+
 /**
- * Reads `window` of `image` resampled to outWidth × outHeight, decoding the
- * image chunk by chunk so that memory use stays bounded for huge images.
- * Downsampling averages pixels (box filter) when affordable, otherwise picks
- * the nearest pixel, which lets it skip tiles that contain no sample point.
+ * Decodes one tile or strip (one sample plane when planar), optionally at
+ * 1/`reduction` of its size. Recently decoded tiles come from a cache.
+ */
+async function readTile(
+  image: GeoTIFFImage,
+  tx: number,
+  ty: number,
+  sample: number,
+  reduction: number,
+  priority: () => number = () => 0,
+): Promise<ArrayBufferLike> {
+  let id = imageIds.get(image);
+  if (id === undefined) {
+    id = nextImageId++;
+    imageIds.set(image, id);
+  }
+  const key = `${id}/${tx}/${ty}/${sample}/${reduction}`;
+  const cached = tileCache.get(key);
+  if (cached) {
+    tileCache.delete(key);
+    tileCache.set(key, cached);
+    return cached;
+  }
+  let pending = tilesDecoding.get(key);
+  if (!pending) {
+    pending = (async () => {
+      await acquireTileRead(priority);
+      try {
+        const decoder = await decoderFor(image);
+        if (reduction === 1) {
+          return (await image.getTileOrStrip(tx, ty, sample, decoder)).data;
+        }
+        return (decoder as JpegDecoder).decodeScaled(await readTileBytes(image, tx, ty, sample), reduction);
+      } finally {
+        releaseTileRead();
+      }
+    })();
+    tilesDecoding.set(key, pending);
+  }
+  try {
+    const data = await pending;
+    if (!tileCache.has(key)) {
+      tileCache.set(key, data);
+      tileCacheBytes += data.byteLength;
+      for (const [oldKey, oldData] of tileCache) {
+        if (tileCacheBytes <= TILE_CACHE_BYTES) break;
+        tileCache.delete(oldKey);
+        tileCacheBytes -= oldData.byteLength;
+      }
+    }
+    return data;
+  } finally {
+    tilesDecoding.delete(key);
+  }
+}
+
+/** The compressed bytes of a tile (what geotiff.js' getTileOrStrip reads before decoding). */
+async function readTileBytes(image: GeoTIFFImage, tx: number, ty: number, sample: number): Promise<ArrayBuffer> {
+  const perRow = Math.ceil(image.getWidth() / image.getTileWidth());
+  const perColumn = Math.ceil(image.getHeight() / image.getTileHeight());
+  const index = (image.planarConfiguration === 2 ? sample * perRow * perColumn : 0) + ty * perRow + tx;
+  const fd = image.getFileDirectory() as unknown as { loadValueIndexed(name: string, index: number): Promise<number | bigint> };
+  const offsets = image.isTiled ? 'TileOffsets' : 'StripOffsets';
+  const counts = image.isTiled ? 'TileByteCounts' : 'StripByteCounts';
+  const [offset, length] = (await Promise.all([fd.loadValueIndexed(offsets, index), fd.loadValueIndexed(counts, index)])).map(Number);
+  const source = (image as unknown as { source: { fetch(ranges: { offset: number; length: number }[]): Promise<ArrayBuffer[]> } }).source;
+  return (await source.fetch([{ offset, length }]))[0];
+}
+
+/**
+ * How much smaller than full size tiles of `image` can be decoded when each
+ * output pixel spans `step` source pixels: 1, 2, 4 or 8.
+ */
+async function tileReduction(image: GeoTIFFImage, step: number): Promise<number> {
+  const decoder = await decoderFor(image);
+  if (!(decoder instanceof JpegDecoder && decoder.scalable && image.isTiled)) {
+    return 1;
+  }
+  const tw = image.getTileWidth();
+  const th = image.getTileHeight();
+  let reduction = 1;
+  while (reduction < 8 && reduction * 2 <= step && tw % (reduction * 2) === 0 && th % (reduction * 2) === 0) {
+    reduction *= 2;
+  }
+  return reduction;
+}
+
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads `window` of `image` resampled to outWidth × outHeight.
+ *
+ * Tiles (or strips) are decoded in bounded batches, so memory use stays small
+ * for huge images, and values are taken straight from the decoded tiles.
+ * Downsampling averages pixels (box filter) when affordable; otherwise it picks
+ * the nearest pixel and skips tiles that contain no sample point. JPEG tiles
+ * are decoded at reduced size when that still gives enough resolution.
  */
 export async function readRegion(
   page: Page,
@@ -525,8 +776,7 @@ export async function readRegion(
   window: PixelWindow,
   outWidth: number,
   outHeight: number,
-  isCancelled: () => boolean,
-  onProgress: (done: number, total: number) => void,
+  options: RegionOptions = {},
 ): Promise<RegionResult> {
   const [x0, y0, x1, y1] = window;
   const ww = x1 - x0;
@@ -557,97 +807,124 @@ export async function readRegion(
 
   const tw = image.getTileWidth();
   const th = image.getTileHeight();
-  const colSpans = tileSpans(exact ? null : srcX, x0, x1, tw);
-  const rowSpans = tileSpans(exact ? null : srcY, y0, y1, th);
+  const colSpans = tileSpans(average || exact ? null : srcX, x0, x1, tw);
+  const rowSpans = tileSpans(average || exact ? null : srcY, y0, y1, th);
+  const tileCols = colSpans.flatMap(([a, b]) => Array.from({ length: b - a }, (_, i) => a + i));
+  const tileRows = rowSpans.flatMap(([a, b]) => Array.from({ length: b - a }, (_, i) => a + i));
+  const total = tileCols.length * tileRows.length;
 
-  // Split spans into chunks that respect the pixel budget.
-  const chunkCols = Math.max(1, Math.floor(2048 / tw));
-  const chunkRows = Math.max(1, Math.floor(CHUNK_PIXELS / Math.min(chunkCols * tw, ww) / th));
-  const split = (spans: [number, number][], size: number) =>
-    spans.flatMap(([a, b]) => {
-      const parts: [number, number][] = [];
-      for (let s = a; s < b; s += size) parts.push([s, Math.min(b, s + size)]);
-      return parts;
+  const reduction = exact ? 1 : await tileReduction(image, Math.min(ww / ow, wh / oh));
+  const shift = Math.log2(reduction);
+  const half = reduction >> 1;
+  const rtw = tw / reduction;
+  const planar = image.planarConfiguration;
+  const tileBytes = (tw * th * image.getBytesPerPixel()) / (reduction * reduction);
+  const batchSize = Math.max(1, Math.min(MAX_BATCH_TILES * reduction, Math.floor(BATCH_BYTES / tileBytes)));
+
+  const nearestType = (s: number): new (length: number) => Sample => {
+    const format = image.getSampleFormat(samples[s]);
+    const bytes = image.getSampleByteSize(samples[s]);
+    return format === 1 && bytes === 1 ? Uint8Array : format === 1 && bytes === 2 ? Uint16Array : Float32Array;
+  };
+  const out: Sample[] = samples.map((_, s) => (average ? new Float32Array(n) : new (nearestType(s))(n)));
+  const counts = average ? new Uint32Array(n) : null;
+
+  const processTile = (tx: number, ty: number, buffers: ArrayBufferLike[]) => {
+    const tileX = tx * tw;
+    const tileY = ty * th;
+    const blockHeight = image.getBlockHeight(ty);
+    const cx0 = Math.max(x0, tileX);
+    const cx1 = Math.min(x1, tileX + tw);
+    const cy0 = Math.max(y0, tileY);
+    const cy1 = Math.min(y1, tileY + blockHeight);
+    if (cx1 <= cx0 || cy1 <= cy0) return;
+    const pixels = rtw * Math.ceil(blockHeight / reduction);
+    const planes = samples.map((sample, s) => samplePlane(image, planar === 1 ? buffers[0] : buffers[s], sample, pixels));
+
+    if (average) {
+      // Each (possibly reduced) tile pixel goes to the output pixel of its centre.
+      const first = planes[0];
+      const rx0 = (cx0 - tileX) >> shift;
+      const rx1 = (cx1 - tileX + reduction - 1) >> shift;
+      const ry0 = (cy0 - tileY) >> shift;
+      const ry1 = (cy1 - tileY + reduction - 1) >> shift;
+      for (let ry = ry0; ry < ry1; ry++) {
+        const sy = Math.min(cy1 - 1, Math.max(cy0, tileY + (ry << shift) + half));
+        const oyBase = dstY![sy - y0] * ow;
+        const rowBase = ry * rtw;
+        for (let rx = rx0; rx < rx1; rx++) {
+          const p = rowBase + rx;
+          const v = first.array[p * first.stride + first.offset];
+          if (v !== v || v === noData) continue;
+          const sx = Math.min(cx1 - 1, Math.max(cx0, tileX + (rx << shift) + half));
+          const o = oyBase + dstX![sx - x0];
+          counts![o]++;
+          out[0][o] += v;
+          for (let s = 1; s < planes.length; s++) {
+            const plane = planes[s];
+            out[s][o] += plane.array[p * plane.stride + plane.offset];
+          }
+        }
+      }
+    } else {
+      const ox0 = lowerBound(srcX!, cx0);
+      const ox1 = lowerBound(srcX!, cx1);
+      const oy0 = lowerBound(srcY!, cy0);
+      const oy1 = lowerBound(srcY!, cy1);
+      for (let s = 0; s < planes.length; s++) {
+        const { array, stride, offset } = planes[s];
+        const dst = out[s];
+        for (let oy = oy0; oy < oy1; oy++) {
+          const rowBase = ((srcY![oy] - tileY) >> shift) * rtw;
+          const dstBase = oy * ow;
+          for (let ox = ox0; ox < ox1; ox++) {
+            dst[dstBase + ox] = array[(rowBase + ((srcX![ox] - tileX) >> shift)) * stride + offset];
+          }
+        }
+      }
+    }
+  };
+
+  const finish = (rows: number): Sample[] => {
+    if (!average) {
+      return out.map((a) => (a as Float32Array).subarray(0, rows * ow));
+    }
+    return out.map((acc) => {
+      const result = new Float32Array(rows * ow);
+      for (let i = 0; i < result.length; i++) {
+        const c = counts![i];
+        result[i] = c ? acc[i] / c : NaN;
+      }
+      return result;
     });
-  const colChunks = split(colSpans, chunkCols);
-  const rowChunks = split(rowSpans, chunkRows);
-  const total = colChunks.length * rowChunks.length;
-
-  let out: Sample[] | null = null;
-  let counts: Uint32Array | null = null;
-  if (average) {
-    out = samples.map(() => new Float32Array(n));
-    counts = new Uint32Array(n);
-  }
+  };
 
   let done = 0;
-  for (const [ty0, ty1] of rowChunks) {
-    for (const [tx0, tx1] of colChunks) {
-      if (isCancelled()) {
+  for (const ty of tileRows) {
+    for (let i = 0; i < tileCols.length; i += batchSize) {
+      await options.waitTurn?.();
+      if (options.isCancelled?.()) {
         throw new CancelledError();
       }
-      const cx0 = Math.max(x0, tx0 * tw);
-      const cx1 = Math.min(x1, tx1 * tw);
-      const cy0 = Math.max(y0, ty0 * th);
-      const cy1 = Math.min(y1, ty1 * th);
-      const cw = cx1 - cx0;
-      const rasters = (await image.readRasters({
-        window: [cx0, cy0, cx1, cy1],
-        samples,
-        interleave: false,
-      })) as unknown as Sample[];
-
-      if (!out) {
-        out = rasters.map((r) => new (r.constructor as new (length: number) => Sample)(n));
-      }
-
-      if (average) {
-        const acc = out as Float32Array[];
-        const first = rasters[0];
-        for (let sy = cy0; sy < cy1; sy++) {
-          const oyBase = dstY![sy - y0] * ow;
-          const rowBase = (sy - cy0) * cw;
-          for (let sx = cx0; sx < cx1; sx++) {
-            const src = rowBase + sx - cx0;
-            const v = first[src];
-            if (v !== v || v === noData) continue;
-            const o = oyBase + dstX![sx - x0];
-            counts![o]++;
-            acc[0][o] += v;
-            for (let s = 1; s < acc.length; s++) acc[s][o] += rasters[s][src];
-          }
-        }
-      } else {
-        const ox0 = lowerBound(srcX!, cx0);
-        const ox1 = lowerBound(srcX!, cx1);
-        const oy0 = lowerBound(srcY!, cy0);
-        const oy1 = lowerBound(srcY!, cy1);
-        for (let s = 0; s < rasters.length; s++) {
-          const src = rasters[s];
-          const dst = out[s];
-          for (let oy = oy0; oy < oy1; oy++) {
-            const rowBase = (srcY![oy] - cy0) * cw - cx0;
-            const dstBase = oy * ow;
-            for (let ox = ox0; ox < ox1; ox++) {
-              dst[dstBase + ox] = src[rowBase + srcX![ox]];
-            }
-          }
-        }
-      }
-      onProgress(++done, total);
+      await Promise.all(
+        tileCols.slice(i, i + batchSize).map(async (tx) => {
+          const buffers =
+            planar === 1
+              ? [await readTile(image, tx, ty, 0, reduction, options.priority)]
+              : await Promise.all(samples.map((sample) => readTile(image, tx, ty, sample, reduction, options.priority)));
+          processTile(tx, ty, buffers);
+          options.onProgress?.(++done, total);
+        }),
+      );
+    }
+    if (options.onRows) {
+      const bottom = Math.min(y1, ty * th + image.getBlockHeight(ty));
+      const rows = average ? (bottom >= y1 ? oh : dstY![bottom - y0]) : lowerBound(srcY!, bottom);
+      options.onRows(rows, () => finish(rows));
     }
   }
 
-  if (average) {
-    const acc = out as Float32Array[];
-    for (let i = 0; i < n; i++) {
-      const c = counts![i];
-      for (let s = 0; s < acc.length; s++) {
-        acc[s][i] = c ? acc[s][i] / c : NaN;
-      }
-    }
-  }
-  return { data: out ?? samples.map(() => new Float32Array(n)), width: ow, height: oh };
+  return { data: average ? finish(oh) : out, width: ow, height: oh };
 }
 
 export async function readPixel(page: Page, x: number, y: number): Promise<number[]> {
@@ -661,6 +938,8 @@ export async function readPixel(page: Page, x: number, y: number): Promise<numbe
 // ---------------------------------------------------------------------------
 
 /** Statistics of the display samples, used for contrast stretching. */
+export type { Stats };
+
 export function computeStats(page: Page, data: Sample[]): Stats {
   const bands = page.kind === 'rgb' ? data.slice(0, 3) : data.slice(0, 1);
   const length = bands[0]?.length ?? 0;
@@ -682,13 +961,13 @@ export function computeStats(page: Page, data: Sample[]): Stats {
   return { min: sorted[0], max: sorted[sorted.length - 1], p02: at(0.02), p98: at(0.98) };
 }
 
-function toneRange(page: Page, tone: ToneMode): [number, number] {
+function toneRange(page: Page, tone: ToneMode, stats_: Stats | undefined): [number, number] {
   const { bits, format } = page;
   if (!page.info.toneAdjustable) {
     // Unsigned integers of 8 bits or less (1, 2, 4, 8 ...).
     return [0, bits >= 8 ? 255 : (1 << bits) - 1];
   }
-  const stats = page.stats ?? { min: 0, max: 1, p02: 0, p98: 1 };
+  const stats = stats_ ?? { min: 0, max: 1, p02: 0, p98: 1 };
   if (tone === 'full' && format !== 3) {
     return format === 2 ? [-(2 ** (bits - 1)), 2 ** (bits - 1) - 1] : [0, 2 ** bits - 1];
   }
@@ -705,10 +984,20 @@ function byteScale(page: Page): number {
   return 255 / (2 ** page.bits - 1);
 }
 
-export function toRGBA(page: Page, data: Sample[], n: number, tone: ToneMode): Uint8ClampedArray {
-  const out = new Uint8ClampedArray(n * 4);
+/**
+ * Converts decoded samples to RGBA. `out` may be larger than `n` pixels; the
+ * rest stays transparent. `stats` overrides the page statistics (partial data).
+ */
+export function toRGBA(
+  page: Page,
+  data: Sample[],
+  n: number,
+  tone: ToneMode,
+  out = new Uint8ClampedArray(n * 4),
+  stats = page.stats,
+): Uint8ClampedArray {
   const noData = page.info.noData;
-  const [lo, hi] = toneRange(page, tone);
+  const [lo, hi] = toneRange(page, tone, stats);
   const k = hi > lo ? 255 / (hi - lo) : 0;
   const mid = hi > lo ? 0 : 128;
   const colorCount = page.kind === 'gray' || page.kind === 'palette' ? 1 : page.kind === 'cmyk' ? 4 : 3;

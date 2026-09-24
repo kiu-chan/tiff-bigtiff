@@ -55,7 +55,7 @@ async function openFixture(name) {
 
 async function render(page, window, outWidth, outHeight, tone = 'minmax') {
   const { image, window: levelWindow } = lib.chooseLevel(page, window, outWidth);
-  const region = await lib.readRegion(page, image, levelWindow, outWidth, outHeight, () => false, () => {});
+  const region = await lib.readRegion(page, image, levelWindow, outWidth, outHeight);
   if (page.info.toneAdjustable) page.stats ??= lib.computeStats(page, region.data);
   return { rgba: lib.toRGBA(page, region.data, outWidth * outHeight, tone), image, width: outWidth, height: outHeight };
 }

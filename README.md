@@ -7,7 +7,9 @@ Open any `.tif`, `.tiff`, `.btf`, `.tf8` or `.tf2` file and it opens in the view
 ## Features
 
 - **Classic TIFF and BigTIFF** (64-bit offsets), little- and big-endian.
-- **Huge images**: the file is read on demand, in byte ranges, so multi-gigabyte files are never loaded whole. A downsampled preview is shown first, and the visible area is re-rendered at full resolution as you zoom in.
+- **Huge images**: the image is shown as tiles, like a map. Only the tiles in view are read, at the level of detail the zoom needs: a rough overview first, then sharper tiles as they arrive. Multi-gigabyte files are never loaded whole, and tiles already shown are kept for panning and zooming back.
+- **Gigapixel images without overviews** (e.g. whole-slide scans): the overview appears within about a second, zooming into any area shows it at full resolution almost immediately, and the zoomed-out view sharpens progressively, starting from the centre.
+- **Fast JPEG**: JPEG tiles are decoded by the browser's native decoder, in parallel, and at 1/2, 1/4 or 1/8 size when that is all the zoom needs.
 - **Pyramids / overviews** (e.g. Cloud Optimized GeoTIFF): the smallest level that is sharp enough is used automatically.
 - **Multi-page** files: switch pages from the toolbar or with <kbd>PageUp</kbd> / <kbd>PageDown</kbd>.
 - **Compression**: none, LZW, Deflate, JPEG, PackBits, Zstandard, WebP, LERC, and CCITT fax (modified Huffman RLE, Group 3, Group 4).
@@ -37,7 +39,7 @@ This viewer is registered as the default editor for TIFF files. To open a file w
 
 - Not supported: JPEG 2000 (e.g. some Aperio SVS), old-style JPEG (compression 6), LZMA, JPEG XL, and uncompressed chroma-subsampled YCbCr.
 - Pyramid levels stored in SubIFDs (as in some OME-TIFF files) are not used; those images are rendered from full resolution.
-- JPEG chroma is upsampled with nearest neighbour, so colour edges may differ slightly from libjpeg.
+- A sharp whole-image view of a huge image without pyramid levels needs every tile of the file, so zoomed all the way out it sharpens over a while (about 2 minutes for a 52-gigapixel, 9 GB slide); a rough overview is shown meanwhile. Zooming in only reads the area in view.
 
 ## Development
 
@@ -55,10 +57,11 @@ Press <kbd>F5</kbd> in VS Code to launch an Extension Development Host.
 ### How it works
 
 - `src/tiffEditor.ts`: the custom editor in the extension host. It serves byte ranges of the file with positional reads.
-- `src/webview/main.ts`: the viewer UI: canvas, zoom/pan, preview and detail layers, info panel.
+- `src/webview/main.ts`: the viewer UI: canvas, zoom/pan, the display tile pyramid, info panel.
 - `src/webview/worker.ts`: a Web Worker that parses and decodes the TIFF with [geotiff.js](https://github.com/geotiffjs/geotiff.js), using a block-cached byte-range source (`messageSource.ts`).
 - `src/webview/tiff.ts`: page/pyramid discovery, chunked region reading with box-filter or nearest-neighbour downsampling, and colour conversion.
 - `src/webview/ccitt.ts`: CCITT T.4 / T.6 fax decoder.
+- `src/webview/jpeg.ts`: JPEG tile decoding with the browser's native decoder, optionally at reduced size (geotiff.js' decoder as fallback).
 
 ## License
 

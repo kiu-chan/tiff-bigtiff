@@ -1,8 +1,11 @@
 import type { ByteRange } from '../shared/protocol';
 
 const BLOCK_SIZE = 64 * 1024;
-/** Slices at least this large bypass the block cache (large tiles / strips). */
-const DIRECT_THRESHOLD = 256 * 1024;
+/**
+ * Slices at least this large (tiles, strips) bypass the block cache: reading
+ * whole blocks around them would read much more than needed.
+ */
+const DIRECT_THRESHOLD = 16 * 1024;
 const CACHE_BLOCKS = 512; // 32 MiB
 /** Upper bound when merging adjacent requests into one read. */
 const MAX_MERGED_READ = 16 * 1024 * 1024;

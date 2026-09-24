@@ -214,6 +214,8 @@ export class TiffEditorProvider implements vscode.CustomReadonlyEditorProvider<T
     <span id="statusSize"></span>
     <span id="statusPos"></span>
     <span id="statusValue"></span>
+    <span class="spacer"></span>
+    <span id="statusProgress"></span>
   </div>
   <script nonce="${nonce}">window.TIFF_WORKER_URL = ${JSON.stringify(asset('dist', 'webview', 'worker.js').toString())};</script>
   <script nonce="${nonce}" src="${asset('dist', 'webview', 'main.js')}"></script>

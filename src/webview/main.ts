@@ -4,6 +4,7 @@ import type {
   MainToWorker,
   PageInfo,
   PixelWindow,
+  TileSpec,
   ToneMode,
   WebviewToHost,
   WorkerToMain,
@@ -16,10 +17,22 @@ declare global {
   }
 }
 
-/** Pages up to this many pixels are previewed at full resolution. */
-const FULL_RES_PIXELS = 16 * 1024 * 1024;
-/** Longest side of the whole-page preview for larger pages. */
-const PREVIEW_LONG_SIDE = 2048;
+/**
+ * The image is shown as a pyramid of display tiles: at level z one tile pixel
+ * spans 2^z image pixels, and a tile is TILE_SIZE pixels square. Only tiles in
+ * view are rendered, at the level that matches the zoom; coarser tiles already
+ * loaded fill in while finer ones arrive.
+ */
+const TILE_SIZE = 512;
+/** The coarsest level shows the whole page at most this large. It is loaded first. */
+const TOP_SIZE = 32;
+/**
+ * Coarser levels are loaded before the level the view needs only when they
+ * need at most this fraction of its data, so that they add little work.
+ */
+const COARSE_LEVEL_SHARE = 1 / 8;
+/** Rendered tiles kept, in pixels (4 bytes each). */
+const TILE_CACHE_PIXELS = 64 * 1024 * 1024;
 const MAX_ZOOM = 64;
 const ZOOM_STEP = 1.25;
 
@@ -40,20 +53,25 @@ const progress = $<HTMLDivElement>('progress');
 const progressBar = $<HTMLDivElement>('progressBar');
 const messageBox = $<HTMLDivElement>('message');
 const statusSize = $<HTMLSpanElement>('statusSize');
+const statusProgress = $<HTMLSpanElement>('statusProgress');
 const statusPos = $<HTMLSpanElement>('statusPos');
 const statusValue = $<HTMLSpanElement>('statusValue');
 
-interface Layer {
-  page: number;
+interface DisplayTile {
+  z: number;
   window: PixelWindow;
   bitmap: ImageBitmap;
-  /** Bitmap pixels per full-resolution image pixel. */
-  resolution: number;
+  final: boolean;
+  /** Tiles of an older generation (before a tone change) are shown until replaced. */
+  generation: number;
+  used: number;
 }
 
 let worker: Worker | undefined;
 let fileName = '';
 let info: FileInfo | undefined;
+/** Rough compressed size of one pixel, to estimate how much a view needs to read. */
+let bytesPerPixel = 1;
 let pageIndex = 0;
 let tone: ToneMode = 'minmax';
 
@@ -62,13 +80,19 @@ const view = { scale: 1, tx: 0, ty: 0 };
 /** 'auto': fit but never enlarge; 'fit': fit to window; undefined: user zoom. */
 let fitMode: 'auto' | 'fit' | undefined = 'auto';
 
-let preview: Layer | undefined;
-let detail: Layer | undefined;
+/** Changes with the page or tone; rendering results of other generations are stale. */
+let generation = 0;
+const tiles = new Map<string, DisplayTile>();
+let tilePixels = 0;
+let drawCounter = 0;
+/** Tiles asked from the worker for the current view, with their progress in source tiles. */
+let requested = new Map<string, { done: number; total: number }>();
+let lastRequest = '';
+const failed = new Set<string>();
+/** Level the current view is rendered at. */
+let viewLevel = 0;
+let tilesTimer: ReturnType<typeof setTimeout> | undefined;
 let requestCounter = 0;
-let previewReq = 0;
-let detailReq = 0;
-let pendingDetail: { window: PixelWindow; resolution: number } | undefined;
-let detailTimer: ReturnType<typeof setTimeout> | undefined;
 let pixelReq = 0;
 /** Dimensions of the page last shown, to keep the view across file reloads. */
 let shownSize = '';
@@ -101,7 +125,7 @@ async function start(fileSize: number): Promise<void> {
   worker?.terminate();
   worker = undefined;
   info = undefined;
-  clearLayers();
+  clearTiles();
   showMessage(undefined);
   showProgress(undefined);
   if (fileSize === 0) {
@@ -117,12 +141,16 @@ async function start(fileSize: number): Promise<void> {
   postToWorker({ type: 'open', fileSize });
 }
 
-function clearLayers(): void {
-  preview?.bitmap.close();
-  detail?.bitmap.close();
-  preview = undefined;
-  detail = undefined;
-  pendingDetail = undefined;
+function clearTiles(): void {
+  for (const tile of tiles.values()) {
+    tile.bitmap.close();
+  }
+  tiles.clear();
+  tilePixels = 0;
+  generation++;
+  requested = new Map();
+  lastRequest = '';
+  failed.clear();
   draw();
 }
 
@@ -131,29 +159,38 @@ async function onWorkerMessage(message: WorkerToMain): Promise<void> {
     case 'read':
       vscode.postMessage({ type: 'read', id: message.id, ranges: message.ranges });
       break;
-    case 'opened':
+    case 'opened': {
       info = message.info;
+      const pixels = info.pages.reduce((sum, p) => sum + p.levels.reduce((s, l) => s + l.width * l.height, 0), 0);
+      bytesPerPixel = pixels ? info.fileSize / pixels : 1;
       setupPages();
       selectPage(Math.min(pageIndex, info.pages.length - 1), true);
       break;
+    }
     case 'openError':
       showProgress(undefined);
       showMessage(`Cannot open ${fileName}: ${message.message}`);
       break;
-    case 'progress':
-      if (message.kind === 'preview' && message.reqId === previewReq) {
-        showProgress(message.done / message.total);
+    case 'progress': {
+      const entry = message.generation === generation ? requested.get(message.id) : undefined;
+      if (entry) {
+        entry.done = message.done;
+        entry.total = message.total;
+        updateProgress();
       }
       break;
-    case 'rendered':
-      await onRendered(message);
+    }
+    case 'tile':
+      await onTile(message);
       break;
-    case 'renderError':
-      if (message.kind === 'preview' && message.reqId === previewReq) {
-        showProgress(undefined);
-        showMessage(message.message);
-      } else if (message.reqId === detailReq) {
-        pendingDetail = undefined;
+    case 'tileError':
+      if (message.generation === generation) {
+        failed.add(message.id);
+        requested.delete(message.id);
+        updateProgress();
+        if (![...tiles.values()].some((t) => t.generation === generation)) {
+          showMessage(message.message);
+        }
       }
       break;
     case 'pixel':
@@ -164,39 +201,60 @@ async function onWorkerMessage(message: WorkerToMain): Promise<void> {
   }
 }
 
-async function onRendered(message: Extract<WorkerToMain, { type: 'rendered' }>): Promise<void> {
-  const isPreview = message.kind === 'preview';
-  if ((isPreview ? previewReq : detailReq) !== message.reqId) {
+async function onTile(message: Extract<WorkerToMain, { type: 'tile' }>): Promise<void> {
+  if (message.generation !== generation) {
     return;
   }
   const image = new ImageData(new Uint8ClampedArray(message.rgba), message.width, message.height);
   const bitmap = await createImageBitmap(image);
-  if ((isPreview ? previewReq : detailReq) !== message.reqId || message.page !== pageIndex) {
+  const page = currentPage();
+  if (message.generation !== generation || !page) {
     bitmap.close();
     return;
   }
-  const layer: Layer = {
-    page: message.page,
-    window: message.window,
-    bitmap,
-    resolution: message.width / (message.window[2] - message.window[0]),
-  };
-  if (isPreview) {
-    preview?.bitmap.close();
-    preview = layer;
-    showProgress(undefined);
-    showMessage(undefined);
-    scheduleDetail(0);
-  } else {
-    detail?.bitmap.close();
-    detail = layer;
-    pendingDetail = undefined;
+  const [z, i, j] = message.id.split('/').map(Number);
+  const old = tiles.get(message.id);
+  if (old) {
+    old.bitmap.close();
+    tilePixels -= old.bitmap.width * old.bitmap.height;
   }
+  tiles.set(message.id, {
+    z,
+    window: tileWindow(page, z, i, j),
+    bitmap,
+    final: message.final,
+    generation,
+    used: ++drawCounter,
+  });
+  tilePixels += bitmap.width * bitmap.height;
+  if (message.final) {
+    const entry = requested.get(message.id);
+    if (entry) entry.done = entry.total;
+    updateProgress();
+    showMessage(undefined);
+  }
+  evictTiles();
   draw();
 }
 
+/** Drops the least recently drawn tiles beyond the cache size (never the overview). */
+function evictTiles(): void {
+  if (tilePixels <= TILE_CACHE_PIXELS) {
+    return;
+  }
+  const page = currentPage();
+  const top = page ? topLevel(page) : Infinity;
+  const byAge = [...tiles.entries()].filter(([, t]) => t.z !== top).sort((a, b) => a[1].used - b[1].used);
+  for (const [id, tile] of byAge) {
+    if (tilePixels <= TILE_CACHE_PIXELS) break;
+    tile.bitmap.close();
+    tilePixels -= tile.bitmap.width * tile.bitmap.height;
+    tiles.delete(id);
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Pages and rendering requests
+// Pages and tiles
 // ---------------------------------------------------------------------------
 
 function setupPages(): void {
@@ -223,7 +281,7 @@ function selectPage(index: number, keepView = false): void {
   shownSize = size;
   pageIndex = index;
   pageSelect.value = String(index);
-  clearLayers();
+  clearTiles();
   showMessage(undefined);
 
   toneGroup.hidden = !page.toneAdjustable;
@@ -240,68 +298,48 @@ function selectPage(index: number, keepView = false): void {
   if (!sameSize) {
     fitMode = 'auto';
   }
-  layout();
-
   if (page.unsupported) {
     showProgress(undefined);
     showMessage(page.unsupported);
-    return;
+  } else {
+    showProgress(0, 'Loading');
   }
-  requestPreview();
+  layout(0);
 }
 
-function requestPreview(): void {
-  const page = currentPage();
-  if (!page) {
-    return;
-  }
-  let outWidth = page.width;
-  let outHeight = page.height;
-  if (page.width * page.height > FULL_RES_PIXELS) {
-    const f = PREVIEW_LONG_SIDE / Math.max(page.width, page.height);
-    outWidth = Math.max(1, Math.round(page.width * f));
-    outHeight = Math.max(1, Math.round(page.height * f));
-  }
-  previewReq = ++requestCounter;
-  detailReq = 0;
-  pendingDetail = undefined;
-  showProgress(0);
-  postToWorker({
-    type: 'render',
-    reqId: previewReq,
-    kind: 'preview',
-    page: pageIndex,
-    window: [0, 0, page.width, page.height],
-    outWidth,
-    outHeight,
-    tone,
-  });
+function setTone(value: ToneMode): void {
+  tone = value;
+  // Keep the tiles on screen until they are replaced; the worker still has the
+  // decoded samples of recent tiles, so this only re-maps colours.
+  generation++;
+  requested = new Map();
+  lastRequest = '';
+  failed.clear();
+  scheduleTiles(0);
 }
 
-function scheduleDetail(delay = 150): void {
-  clearTimeout(detailTimer);
-  detailTimer = setTimeout(updateDetail, delay);
+function topLevel(page: PageInfo): number {
+  return Math.max(0, Math.ceil(Math.log2(Math.max(page.width, page.height) / TOP_SIZE)));
 }
 
-function covers(outer: PixelWindow, inner: PixelWindow): boolean {
-  return outer[0] <= inner[0] && outer[1] <= inner[1] && outer[2] >= inner[2] && outer[3] >= inner[3];
+function tileWindow(page: PageInfo, z: number, i: number, j: number): PixelWindow {
+  const span = TILE_SIZE * 2 ** z;
+  return [i * span, j * span, Math.min(page.width, (i + 1) * span), Math.min(page.height, (j + 1) * span)];
 }
 
-/** Requests a sharper rendering of the visible area when the preview is too coarse. */
-function updateDetail(): void {
-  const page = currentPage();
-  if (!page || !preview || page.unsupported) {
-    return;
-  }
-  const needed = Math.min(1, view.scale * devicePixelRatio);
-  if (preview.resolution >= needed * 0.99) {
-    if (detail) {
-      detail.bitmap.close();
-      detail = undefined;
-      draw();
-    }
-    return;
-  }
+function tileSpec(page: PageInfo, z: number, i: number, j: number): TileSpec {
+  const window = tileWindow(page, z, i, j);
+  const f = 2 ** z;
+  return {
+    id: `${z}/${i}/${j}`,
+    window,
+    outWidth: Math.max(1, Math.ceil((window[2] - window[0]) / f)),
+    outHeight: Math.max(1, Math.ceil((window[3] - window[1]) / f)),
+  };
+}
+
+/** Image area in view, in full-resolution pixels. */
+function visibleWindow(page: PageInfo): PixelWindow | undefined {
   const s = view.scale;
   const visible: PixelWindow = [
     Math.max(0, Math.floor(-view.tx / s)),
@@ -309,52 +347,115 @@ function updateDetail(): void {
     Math.min(page.width, Math.ceil((stage.clientWidth - view.tx) / s)),
     Math.min(page.height, Math.ceil((stage.clientHeight - view.ty) / s)),
   ];
-  if (visible[2] <= visible[0] || visible[3] <= visible[1]) {
-    return;
-  }
-  const satisfied = (layer: { window: PixelWindow; resolution: number } | undefined) =>
-    layer && layer.resolution >= needed * 0.99 && covers(layer.window, visible);
-  if ((detail?.page === pageIndex && satisfied(detail)) || satisfied(pendingDetail)) {
-    return;
-  }
-  // Render a little more than visible so that small pans do not need a new request.
-  const mx = Math.round((visible[2] - visible[0]) * 0.1);
-  const my = Math.round((visible[3] - visible[1]) * 0.1);
-  const window: PixelWindow = [
-    Math.max(0, visible[0] - mx),
-    Math.max(0, visible[1] - my),
-    Math.min(page.width, visible[2] + mx),
-    Math.min(page.height, visible[3] + my),
-  ];
-  const outWidth = Math.max(1, Math.round((window[2] - window[0]) * needed));
-  const outHeight = Math.max(1, Math.round((window[3] - window[1]) * needed));
-  pendingDetail = { window, resolution: outWidth / (window[2] - window[0]) };
-  detailReq = ++requestCounter;
-  postToWorker({ type: 'render', reqId: detailReq, kind: 'detail', page: pageIndex, window, outWidth, outHeight, tone });
+  return visible[2] > visible[0] && visible[3] > visible[1] ? visible : undefined;
 }
 
-function setTone(value: ToneMode): void {
-  tone = value;
-  if (!currentPage() || !preview) {
+/** Tiles of level z overlapping `visible`, nearest to its centre first. */
+function tilesInView(page: PageInfo, z: number, visible: PixelWindow): TileSpec[] {
+  const span = TILE_SIZE * 2 ** z;
+  const cx = (visible[0] + visible[2]) / 2;
+  const cy = (visible[1] + visible[3]) / 2;
+  const specs: { spec: TileSpec; d: number }[] = [];
+  for (let j = Math.floor(visible[1] / span); j < Math.ceil(visible[3] / span); j++) {
+    for (let i = Math.floor(visible[0] / span); i < Math.ceil(visible[2] / span); i++) {
+      const d = Math.hypot((i + 0.5) * span - cx, (j + 0.5) * span - cy);
+      specs.push({ spec: tileSpec(page, z, i, j), d });
+    }
+  }
+  return specs.sort((a, b) => a.d - b.d).map((s) => s.spec);
+}
+
+/**
+ * Estimated file tiles (or strips) a display tile needs, and their bytes. It
+ * mirrors the worker: the smallest pyramid level with enough resolution, and
+ * at most one file tile per output pixel when sampling sparsely.
+ */
+function estimate(page: PageInfo, spec: TileSpec): { tiles: number; bytes: number } {
+  const [x0, y0, x1, y1] = spec.window;
+  const scale = spec.outWidth / (x1 - x0);
+  let level = page.levels[0];
+  for (const candidate of page.levels) {
+    if (candidate.width / page.width >= scale * 0.98) level = candidate;
+  }
+  const fx = level.width / page.width;
+  const fy = level.height / page.height;
+  const across = Math.ceil((x1 * fx) / level.tileWidth) - Math.floor((x0 * fx) / level.tileWidth);
+  const down = Math.ceil((y1 * fy) / level.tileHeight) - Math.floor((y0 * fy) / level.tileHeight);
+  const count = Math.min(across, spec.outWidth) * Math.min(down, spec.outHeight);
+  return { tiles: count, bytes: count * level.tileWidth * level.tileHeight * bytesPerPixel };
+}
+
+function scheduleTiles(delay = 120): void {
+  clearTimeout(tilesTimer);
+  tilesTimer = setTimeout(updateTiles, delay);
+}
+
+/** Asks the worker for the tiles the current view needs, coarse levels first. */
+function updateTiles(): void {
+  const page = currentPage();
+  if (!page || page.unsupported || !worker) {
     return;
   }
-  // The worker keeps the decoded samples, so this only re-maps colours.
-  requestPreview();
-  if (detail) {
-    const { window, bitmap } = detail;
-    detailReq = ++requestCounter;
-    pendingDetail = { window, resolution: detail.resolution };
-    postToWorker({
-      type: 'render',
-      reqId: detailReq,
-      kind: 'detail',
-      page: pageIndex,
-      window,
-      outWidth: bitmap.width,
-      outHeight: bitmap.height,
-      tone,
-    });
+  const visible = visibleWindow(page);
+  if (!visible) {
+    return;
   }
+  const top = topLevel(page);
+  const levelCost = new Map<number, number>();
+  const cost = (z: number) => {
+    let bytes = levelCost.get(z);
+    if (bytes === undefined) {
+      bytes = tilesInView(page, z, visible).reduce((sum, spec) => sum + estimate(page, spec).bytes, 0);
+      levelCost.set(z, bytes);
+    }
+    return bytes;
+  };
+  // Always the full sharpness the zoom needs, however much data that is.
+  const z = Math.min(top, Math.max(0, Math.floor(Math.log2(1 / (view.scale * devicePixelRatio)))));
+  if (z !== viewLevel) {
+    viewLevel = z;
+    draw();
+  }
+
+  // The overview first, then coarser levels that cost much less than the
+  // target level (they show something quickly), then the target level.
+  // A huge image without overviews needs every file tile when zoomed out;
+  // the coarse levels only sample some of them.
+  const levels = [top];
+  for (let l = top - 1; l > z; l--) {
+    if (cost(l) <= cost(z) * COARSE_LEVEL_SHARE) levels.push(l);
+  }
+  if (z < top) levels.push(z);
+
+  const list: TileSpec[] = [];
+  for (const l of levels) {
+    for (const spec of tilesInView(page, l, l === top ? [0, 0, page.width, page.height] : visible)) {
+      const tile = tiles.get(spec.id);
+      if ((tile?.final && tile.generation === generation) || failed.has(spec.id)) continue;
+      list.push(spec);
+    }
+  }
+  const key = `${generation}|${list.map((s) => s.id).join(',')}`;
+  if (key === lastRequest) {
+    return;
+  }
+  lastRequest = key;
+  const previous = requested;
+  requested = new Map(
+    list.map((spec) => [spec.id, previous.get(spec.id) ?? { done: 0, total: Math.max(1, estimate(page, spec).tiles) }]),
+  );
+  updateProgress();
+  postToWorker({ type: 'tiles', generation, page: pageIndex, tone, tiles: list });
+}
+
+function updateProgress(): void {
+  let done = 0;
+  let total = 0;
+  for (const entry of requested.values()) {
+    done += entry.done;
+    total += entry.total;
+  }
+  showProgress(total && done < total ? done / total : undefined, 'Loading');
 }
 
 // ---------------------------------------------------------------------------
@@ -388,7 +489,7 @@ function clampView(): void {
   view.ty = clampAxis(view.ty, page.height * view.scale, stage.clientHeight);
 }
 
-function layout(): void {
+function layout(delay?: number): void {
   if (fitMode) {
     const s = fitScale();
     view.scale = fitMode === 'auto' ? Math.min(1, s) : s;
@@ -396,7 +497,7 @@ function layout(): void {
   clampView();
   updateZoomLabel();
   draw();
-  scheduleDetail();
+  scheduleTiles(delay);
 }
 
 function zoomTo(scale: number, anchorX = stage.clientWidth / 2, anchorY = stage.clientHeight / 2): void {
@@ -448,10 +549,8 @@ function checkerPattern(): CanvasPattern {
 
 function draw(): void {
   const dpr = devicePixelRatio;
-  const cw = stage.clientWidth;
-  const ch = stage.clientHeight;
-  const width = Math.round(cw * dpr);
-  const height = Math.round(ch * dpr);
+  const width = Math.round(stage.clientWidth * dpr);
+  const height = Math.round(stage.clientHeight * dpr);
   if (canvas.width !== width || canvas.height !== height) {
     canvas.width = width;
     canvas.height = height;
@@ -459,63 +558,88 @@ function draw(): void {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, width, height);
   const page = currentPage();
-  if (!page || !preview) {
+  if (!page || tiles.size === 0) {
     return;
   }
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-  const s = view.scale;
-  if (page.hasAlpha) {
-    const x0 = Math.max(0, view.tx);
-    const y0 = Math.max(0, view.ty);
-    const x1 = Math.min(cw, view.tx + page.width * s);
-    const y1 = Math.min(ch, view.ty + page.height * s);
-    if (x1 > x0 && y1 > y0) {
-      ctx.fillStyle = checkerPattern();
-      ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
-    }
+  const visible = visibleWindow(page);
+  if (!visible) {
+    return;
   }
-  drawLayer(preview, cw, ch);
-  if (detail && detail.page === pageIndex) {
-    drawLayer(detail, cw, ch);
+  // Coarse levels first, finer ones on top. Finer tiles than the view needs
+  // (left from zooming in) are drawn too, down to two levels below.
+  const shown = [...tiles.values()]
+    .filter(
+      (t) =>
+        t.z >= viewLevel - 2 &&
+        t.window[0] < visible[2] &&
+        t.window[2] > visible[0] &&
+        t.window[1] < visible[3] &&
+        t.window[3] > visible[1],
+    )
+    .sort((a, b) => b.z - a.z || a.generation - b.generation);
+  if (page.hasAlpha) {
+    const [x0, y0, x1, y1] = deviceRect(page, [0, 0, page.width, page.height]);
+    ctx.fillStyle = checkerPattern();
+    ctx.fillRect(Math.max(0, x0), Math.max(0, y0), Math.min(width, x1) - Math.max(0, x0), Math.min(height, y1) - Math.max(0, y0));
+  }
+  for (const tile of shown) {
+    tile.used = ++drawCounter;
+    drawTile(page, tile, width, height);
   }
 }
 
-function drawLayer(layer: Layer, cw: number, ch: number): void {
-  const s = view.scale;
-  const [wx0, wy0, wx1, wy1] = layer.window;
-  const destX = view.tx + wx0 * s;
-  const destY = view.ty + wy0 * s;
-  const destW = (wx1 - wx0) * s;
-  const destH = (wy1 - wy0) * s;
-  // Clip to the viewport to keep coordinates small at high zoom.
-  const dx0 = Math.max(0, destX);
-  const dy0 = Math.max(0, destY);
-  const dx1 = Math.min(cw, destX + destW);
-  const dy1 = Math.min(ch, destY + destH);
-  if (dx1 <= dx0 || dy1 <= dy0) {
+/** Canvas (device pixel) rectangle of an image window, with edges rounded so that tiles meet exactly. */
+function deviceRect(page: PageInfo, window: PixelWindow): [number, number, number, number] {
+  const dpr = devicePixelRatio;
+  const s = view.scale * dpr;
+  const ox = view.tx * dpr;
+  const oy = view.ty * dpr;
+  return [
+    Math.round(ox + window[0] * s),
+    Math.round(oy + window[1] * s),
+    Math.round(ox + window[2] * s),
+    Math.round(oy + window[3] * s),
+  ];
+}
+
+function drawTile(page: PageInfo, tile: DisplayTile, width: number, height: number): void {
+  const [x0, y0, x1, y1] = deviceRect(page, tile.window);
+  // Clip to the canvas to keep coordinates small at high zoom.
+  const cx0 = Math.max(0, x0);
+  const cy0 = Math.max(0, y0);
+  const cx1 = Math.min(width, x1);
+  const cy1 = Math.min(height, y1);
+  if (cx1 <= cx0 || cy1 <= cy0) {
     return;
   }
-  const bw = layer.bitmap.width;
-  const bh = layer.bitmap.height;
-  const sx0 = ((dx0 - destX) / destW) * bw;
-  const sy0 = ((dy0 - destY) / destH) * bh;
-  const sx1 = ((dx1 - destX) / destW) * bw;
-  const sy1 = ((dy1 - destY) / destH) * bh;
-  const devicePxPerBitmapPx = (s / layer.resolution) * devicePixelRatio;
+  const bw = tile.bitmap.width;
+  const bh = tile.bitmap.height;
+  const sx0 = ((cx0 - x0) / (x1 - x0)) * bw;
+  const sy0 = ((cy0 - y0) / (y1 - y0)) * bh;
+  const sx1 = ((cx1 - x0) / (x1 - x0)) * bw;
+  const sy1 = ((cy1 - y0) / (y1 - y0)) * bh;
+  if (page.hasAlpha && tile.final) {
+    // Do not let coarser tiles show through transparent pixels.
+    ctx.clearRect(cx0, cy0, cx1 - cx0, cy1 - cy0);
+    ctx.fillStyle = checkerPattern();
+    ctx.fillRect(cx0, cy0, cx1 - cx0, cy1 - cy0);
+  }
   // Show crisp pixels when magnifying full-resolution data; smooth otherwise.
-  ctx.imageSmoothingEnabled = !(layer.resolution >= 0.999 && devicePxPerBitmapPx >= 1);
+  ctx.imageSmoothingEnabled = !(tile.z === 0 && view.scale * devicePixelRatio >= 1);
   ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(layer.bitmap, sx0, sy0, sx1 - sx0, sy1 - sy0, dx0, dy0, dx1 - dx0, dy1 - dy0);
+  ctx.drawImage(tile.bitmap, sx0, sy0, sx1 - sx0, sy1 - sy0, cx0, cy0, cx1 - cx0, cy1 - cy0);
 }
 
 // ---------------------------------------------------------------------------
 // UI helpers
 // ---------------------------------------------------------------------------
 
-function showProgress(fraction: number | undefined): void {
+function showProgress(fraction: number | undefined, label = 'Loading'): void {
   progress.hidden = fraction === undefined;
-  progressBar.style.width = `${Math.round((fraction ?? 0) * 100)}%`;
+  const percent = (fraction ?? 0) * 100;
+  progressBar.style.width = `${percent}%`;
+  statusProgress.textContent =
+    fraction === undefined ? '' : `${label} ${percent < 10 ? percent.toFixed(1) : Math.floor(percent)}%`;
 }
 
 function showMessage(text: string | undefined): void {
@@ -635,7 +759,7 @@ stage.addEventListener(
       view.ty -= event.deltaY * lineScale;
       clampView();
       draw();
-      scheduleDetail();
+      scheduleTiles();
     }
   },
   { passive: false },
@@ -659,7 +783,7 @@ stage.addEventListener('pointermove', (event) => {
     drag.y = event.clientY;
     clampView();
     draw();
-    scheduleDetail();
+    scheduleTiles();
     return;
   }
   updatePointerReadout(event);
@@ -690,7 +814,7 @@ stage.addEventListener('dblclick', (event) => {
 
 function updatePointerReadout(event: MouseEvent): void {
   const page = currentPage();
-  if (!page || !preview) {
+  if (!page || page.unsupported) {
     return;
   }
   const [px, py] = stagePoint(event);
@@ -750,7 +874,7 @@ document.addEventListener('keydown', (event) => {
       view.ty += event.key === 'ArrowUp' ? step : event.key === 'ArrowDown' ? -step : 0;
       clampView();
       draw();
-      scheduleDetail();
+      scheduleTiles();
       break;
     }
     default:

@@ -125,7 +125,7 @@ select {
   top: 0;
   left: 0;
   right: 0;
-  height: 2px;
+  height: 3px;
   background: transparent;
   pointer-events: none;
 }
@@ -205,4 +205,8 @@ select {
   color: var(--vscode-descriptionForeground);
   white-space: nowrap;
   overflow: hidden;
+}
+
+#status .spacer {
+  flex: 1;
 }
