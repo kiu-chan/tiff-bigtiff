@@ -8,4 +8,4 @@
 - Values are read directly from decoded tiles, only where they are needed.
 - Loading progress is shown as a percentage in the status bar.
 
-- First release: TIFF / BigTIFF viewer with on-demand reading of large files, pyramid support, multi-page navigation, contrast stretching for high bit depth and float data, pixel readout, info panel, and CCITT fax decoding.
+- First release: TIFF/BigTIFF viewer with on-demand reading of large files, pyramid support, multi-page navigation, contrast stretching for high bit depth and float data, pixel readout, info panel, and CCITT fax decoding.

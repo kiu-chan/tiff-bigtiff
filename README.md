@@ -1,4 +1,4 @@
-# tiff/bigtiff
+# TIFF/BigTIFF
 
 View **TIFF** and **BigTIFF** images directly in VS Code, including files far larger than memory.
 
