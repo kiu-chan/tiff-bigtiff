@@ -1,0 +1,95 @@
+{
+  "name": "tiff-bigtiff",
+  "displayName": "tiff/bigtiff",
+  "description": "View TIFF and BigTIFF images in VS Code: multi-page, tiled, pyramidal (COG), 1–64-bit, float data, and LZW / Deflate / JPEG / ZSTD / WebP / LERC / PackBits / CCITT fax compression.",
+  "version": "0.1.0",
+  "publisher": "your-publisher-id",
+  "author": {
+    "name": "kiu-chan",
+    "email": "baokhanhntby@gmail.com"
+  },
+  "license": "MIT",
+  "icon": "images/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-github-user/tiff-bigtiff.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-github-user/tiff-bigtiff/issues"
+  },
+  "homepage": "https://github.com/your-github-user/tiff-bigtiff#readme",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
+  "keywords": [
+    "tiff",
+    "tif",
+    "bigtiff",
+    "geotiff",
+    "cog",
+    "image",
+    "viewer",
+    "preview"
+  ],
+  "main": "./dist/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    },
+    "virtualWorkspaces": true
+  },
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "tiffBigtiff.viewer",
+        "displayName": "TIFF/BigTIFF Viewer",
+        "selector": [
+          {
+            "filenamePattern": "*.tif"
+          },
+          {
+            "filenamePattern": "*.tiff"
+          },
+          {
+            "filenamePattern": "*.TIF"
+          },
+          {
+            "filenamePattern": "*.TIFF"
+          },
+          {
+            "filenamePattern": "*.btf"
+          },
+          {
+            "filenamePattern": "*.tf8"
+          },
+          {
+            "filenamePattern": "*.tf2"
+          }
+        ],
+        "priority": "default"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc -p . --noEmit && tsc -p src/webview --noEmit",
+    "test": "npm run build && node test/decode.test.mjs",
+    "vscode:prepublish": "npm run typecheck && node esbuild.mjs --production",
+    "package": "vsce package",
+    "publish:vsce": "vsce publish",
+    "publish:ovsx": "ovsx publish"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^4.0.0",
+    "esbuild": "^0.28.2",
+    "geotiff": "^3.0.5",
+    "typescript": "^5.9.3"
+  }
+}
