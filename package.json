@@ -3,7 +3,7 @@
   "displayName": "TIFF/BigTIFF",
   "description": "View TIFF and BigTIFF images in VS Code: multi-page, tiled, pyramidal (COG), 1–64-bit, float data, and LZW / Deflate / JPEG / ZSTD / WebP / LERC / PackBits / CCITT fax compression.",
   "version": "0.1.0",
-  "publisher": "kiu-chan",
+  "publisher": "monlycute",
   "author": {
     "name": "kiu-chan",
     "email": "baokhanhntby@gmail.com"
